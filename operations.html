@@ -440,9 +440,42 @@ function dlCSV(rows,cols,fname){
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["﻿"+csv],{type:"text/csv"}));a.download=fname;a.click();
 }
 function readFileAsDataURL(file){return new Promise(res=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.readAsDataURL(file);});}
+// Downscales+recompresses an image file to a JPEG data URL capped at maxDim
+// on its longest side. Item photos are stored as base64 in localStorage
+// (shared 5-10MB-per-origin quota across every property/room/item), and an
+// unmodified phone photo is often 3-8MB on its own — one or two uploads can
+// exhaust the quota, after which every further save silently fails (the
+// item appears to save, then reverts on next load). Resizing keeps a single
+// photo well under ~200KB so many photos fit comfortably.
+function readImageAsResizedDataURL(file,maxDim=1024,quality=0.75){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    const objectUrl=URL.createObjectURL(file);
+    img.onload=()=>{
+      URL.revokeObjectURL(objectUrl);
+      let{width:w,height:h}=img;
+      if(w>maxDim||h>maxDim){
+        const scale=maxDim/Math.max(w,h);
+        w=Math.round(w*scale);h=Math.round(h*scale);
+      }
+      const canvas=document.createElement("canvas");
+      canvas.width=w;canvas.height=h;
+      canvas.getContext("2d").drawImage(img,0,0,w,h);
+      resolve(canvas.toDataURL("image/jpeg",quality));
+    };
+    img.onerror=()=>{URL.revokeObjectURL(objectUrl);reject(new Error("Could not read image file."));};
+    img.src=objectUrl;
+  });
+}
 function useLS(key,init){
   const[v,setV]=useState(()=>{try{const s=localStorage.getItem(key);return s?JSON.parse(s):(typeof init==="function"?init():init);}catch{return typeof init==="function"?init():init;}});
-  useEffect(()=>{try{localStorage.setItem(key,JSON.stringify(v));}catch{}},[v,key]);
+  useEffect(()=>{
+    try{localStorage.setItem(key,JSON.stringify(v));}
+    // A failed write here previously vanished silently — the in-memory
+    // state (and whatever was on screen) looked fine until the next
+    // reload, when the unsaved change was gone with no explanation.
+    catch(err){console.warn("[localStorage]",key,"write failed — this device's storage is likely full:",err);}
+  },[v,key]);
   return[v,setV];
 }
 /* Real-time Firestore sync hook – falls back to localStorage when offline.
@@ -453,14 +486,24 @@ function useFirestore(key,init,debounceMs=1500){
   const[v,setV]=useState(()=>{try{const s=localStorage.getItem(key);return s?JSON.parse(s):(typeof init==="function"?init():init);}catch{return typeof init==="function"?init():init;}});
   const timerRef=useRef(null);
   const pendingRef=useRef(null);
+  // True from the moment a local edit is made until its write has been
+  // confirmed (or failed) — while true, incoming snapshots are held back
+  // instead of applied, so an in-progress edit can never be silently
+  // overwritten by a snapshot that predates it (initial cache/server
+  // double-fire, listener reconnect, another device's unrelated write, etc).
+  const hasLocalEditRef=useRef(false);
+  const latestSnapshotRef=useRef(null);
   useEffect(()=>{
     if(!window.db)return;
     const unsub=window.db.collection("ops").doc(key).onSnapshot(snap=>{
       if(snap.exists){
         const data=snap.data().v;
-        // Cancel any queued local write – incoming data from another device takes priority
-        clearTimeout(timerRef.current);
-        pendingRef.current=null;
+        if(hasLocalEditRef.current){
+          // Hold this snapshot — an edit is still in flight. Applied once
+          // the pending write settles (see setTimeout below).
+          latestSnapshotRef.current=data;
+          return;
+        }
         try{localStorage.setItem(key,JSON.stringify(data));}catch{}
         setV(data);
       }
@@ -468,17 +511,31 @@ function useFirestore(key,init,debounceMs=1500){
     return()=>unsub();
   },[key]);
   function setVSync(valOrFn){
+    hasLocalEditRef.current=true;
     setV(prev=>{
       const next=typeof valOrFn==="function"?valOrFn(prev):valOrFn;
       try{localStorage.setItem(key,JSON.stringify(next));}catch{}
       pendingRef.current=next;
       clearTimeout(timerRef.current);
       timerRef.current=setTimeout(()=>{
+        const settle=()=>{
+          hasLocalEditRef.current=false;
+          // A newer snapshot arrived while we were mid-edit — apply it now.
+          if(latestSnapshotRef.current!==null){
+            const data=latestSnapshotRef.current;
+            latestSnapshotRef.current=null;
+            try{localStorage.setItem(key,JSON.stringify(data));}catch{}
+            setV(data);
+          }
+        };
         if(window.db&&pendingRef.current!==null){
           window.db.collection("ops").doc(key)
             .set({v:pendingRef.current,_ts:Date.now()})
-            .catch(e=>console.warn("[FS write]",key,e));
+            .then(settle)
+            .catch(e=>{console.warn("[FS write]",key,e);settle();});
           pendingRef.current=null;
+        }else{
+          settle();
         }
       },debounceMs);
       return next;
@@ -662,6 +719,24 @@ function useIsMobile(){
   },[]);
   return mob;
 }
+// Top-level (not nested in PMExcelTable) so it keeps a stable component
+// identity across re-renders — a nested definition gets redefined every
+// render, which makes React unmount+remount the <input> on every keystroke
+// and drop focus (same bug previously fixed for PurchaseFormRow).
+function AddRow({subcat,colSpan,addInputs,setAddInputs,doAddItem}){
+  const key=subcat||"__room";
+  return(
+    <tr><td colSpan={colSpan} style={{padding:"5px 6px"}}>
+      <div style={{display:"flex",gap:4}}>
+        <input value={addInputs[key]||""} onChange={e=>setAddInputs(a=>({...a,[key]:e.target.value}))}
+          onKeyDown={e=>e.key==="Enter"&&doAddItem(subcat)}
+          placeholder="+ Type item name and press Enter or +"
+          style={{flex:1,padding:"4px 8px",border:"1px dashed #0F5C4C",borderRadius:5,fontSize:".74rem",outline:"none",fontFamily:"var(--ff)",background:"#F0FAF7"}}/>
+        <button onClick={()=>doAddItem(subcat)} style={{padding:"4px 10px",background:"#0F5C4C",color:"#fff",border:"none",borderRadius:5,fontSize:".74rem",cursor:"pointer",fontWeight:700}}>+</button>
+      </div>
+    </td></tr>
+  );
+}
 function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readOnly,customItems,setCustomItems,editItems}){
   const scrollRef=useDragScroll();
   const[lightbox,setLightbox]=useState(null);
@@ -832,20 +907,6 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
     });
     setAddInputs(a=>({...a,[key]:""}));
   }
-  function AddRow({subcat,colSpan}){
-    const key=subcat||"__room";
-    return(
-      <tr><td colSpan={colSpan} style={{padding:"5px 6px"}}>
-        <div style={{display:"flex",gap:4}}>
-          <input value={addInputs[key]||""} onChange={e=>setAddInputs(a=>({...a,[key]:e.target.value}))}
-            onKeyDown={e=>e.key==="Enter"&&doAddItem(subcat)}
-            placeholder="+ Type item name and press Enter or +"
-            style={{flex:1,padding:"4px 8px",border:"1px dashed #0F5C4C",borderRadius:5,fontSize:".74rem",outline:"none",fontFamily:"var(--ff)",background:"#F0FAF7"}}/>
-          <button onClick={()=>doAddItem(subcat)} style={{padding:"4px 10px",background:"#0F5C4C",color:"#fff",border:"none",borderRadius:5,fontSize:".74rem",cursor:"pointer",fontWeight:700}}>+</button>
-        </div>
-      </td></tr>
-    );
-  }
   const allItems=subcats?Object.values(subcats).flat():items;
 
   function getV(item,room,field){
@@ -869,13 +930,22 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
   }
   async function handlePhoto(e,item,room){
     const file=e.target.files[0];if(!file)return;
-    const dataUrl=await readFileAsDataURL(file);
+    let dataUrl;
+    try{
+      dataUrl=await readImageAsResizedDataURL(file);
+    }catch(err){
+      console.error("Photo resize failed:",err);
+      alert("Could not process that photo. Try a different image.");
+      e.target.value="";
+      return;
+    }
     if(setPhotos)setPhotos(prev=>{
       const n=JSON.parse(JSON.stringify(prev||{}));
       const rk=room||"_";
       if(!n[propId])n[propId]={};if(!n[propId][rk])n[propId][rk]={};
       n[propId][rk][item]=dataUrl;return n;
     });
+    e.target.value="";
   }
   function removePhoto(item,room){
     if(setPhotos)setPhotos(prev=>{
@@ -964,7 +1034,7 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
                 })}
                 {editItems&&<td style={{padding:"0 4px"}}><button onClick={()=>removeItem(item,null)} style={{background:"none",border:"none",color:"#EF4444",cursor:"pointer",fontSize:13,lineHeight:1,padding:2}} title="Remove item">✕</button></td>}
               </tr>),
-              ...(editItems?[<AddRow key="__add_room" subcat={null} colSpan={2+rooms.length*(isMobile?2:3)+1}/>]:[]),
+              ...(editItems?[<AddRow key="__add_room" subcat={null} colSpan={2+rooms.length*(isMobile?2:3)+1} addInputs={addInputs} setAddInputs={setAddInputs} doAddItem={doAddItem}/>]:[]),
               // Sub-sections: Guest Amenities, Washroom, etc.
               ...(areaData.subSections||[]).flatMap(ss=>{
                 const ssKey="__ss_"+ss.label;
@@ -1004,7 +1074,7 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
                     })}
                     {editItems&&<td style={{padding:"0 4px"}}><button onClick={()=>removeItem(item,ssKey)} style={{background:"none",border:"none",color:"#EF4444",cursor:"pointer",fontSize:13,lineHeight:1,padding:2}} title="Remove item">✕</button></td>}
                   </tr>),
-                  ...(editItems?[<AddRow key={"__add_"+ssKey} subcat={ssKey} colSpan={2+colCount+1}/>]:[])
+                  ...(editItems?[<AddRow key={"__add_"+ssKey} subcat={ssKey} colSpan={2+colCount+1} addInputs={addInputs} setAddInputs={setAddInputs} doAddItem={doAddItem}/>]:[])
                 ];
               })
             ]
@@ -1031,7 +1101,7 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
                     {editItems&&<td style={{padding:"0 4px"}}><button onClick={()=>removeItem(item,sub)} style={{background:"none",border:"none",color:"#EF4444",cursor:"pointer",fontSize:13,lineHeight:1,padding:2}} title="Remove item">✕</button></td>}
                   </tr>;
                 }),
-                ...(editItems?[<AddRow key={"__add_"+sub} subcat={sub} colSpan={5+(editItems?1:0)}/>]:[])
+                ...(editItems?[<AddRow key={"__add_"+sub} subcat={sub} colSpan={5+(editItems?1:0)} addInputs={addInputs} setAddInputs={setAddInputs} doAddItem={doAddItem}/>]:[])
               ])
               :allItems.map(item=>{
                 const dmg=getV(item,null,"damage");const qty=getV(item,null,"qty");const dcfg=DMG[dmg]||DMG[""];
@@ -1053,6 +1123,90 @@ function PMExcelTable({propId,area,yr,mn,checks,setChecks,photos,setPhotos,readO
       </table>
     </div>
     </>
+  );
+}
+
+/* ══ ASSET REGISTER (Assets tab) ════════════════════════════
+   Fixed assets (AC units, gensets, etc.) don't fit the per-room qty/
+   condition grid every other area uses — each one is a single physical
+   item with its own purchase date, service history, and serial number.
+   This renders a flat editable register instead of the pivoted table. */
+const ASSET_COLS=[
+  {key:"areaName",label:"Area Name"},
+  {key:"itemName",label:"Item Name"},
+  {key:"brand",label:"Brand"},
+  {key:"purchaseDate",label:"Date of Purchase",type:"date"},
+  {key:"serviceDueDate",label:"Service Due Date",type:"date"},
+  {key:"lastServiceDate",label:"Last Service Date",type:"date"},
+  {key:"assetId",label:"Asset ID"},
+  {key:"serialNumber",label:"Serial Number"},
+];
+function emptyAssetRow(){
+  return{id:Date.now()+"_"+Math.random().toString(36).slice(2),areaName:"",itemName:"",brand:"",purchaseDate:"",serviceDueDate:"",lastServiceDate:"",assetId:"",serialNumber:""};
+}
+function AssetRegisterTable({propId,assets,setAssets,readOnly,rooms}){
+  const rows=(assets&&assets[propId])||[];
+  function updateRow(id,field,val){
+    if(readOnly||!setAssets)return;
+    setAssets(prev=>{
+      const list=(prev&&prev[propId])||[];
+      return{...(prev||{}),[propId]:list.map(r=>r.id===id?{...r,[field]:val}:r)};
+    });
+  }
+  function addRow(){
+    if(readOnly||!setAssets)return;
+    setAssets(prev=>{
+      const list=(prev&&prev[propId])||[];
+      return{...(prev||{}),[propId]:[...list,emptyAssetRow()]};
+    });
+  }
+  function removeRow(id){
+    if(readOnly||!setAssets)return;
+    if(!window.confirm("Remove this asset from the register?"))return;
+    setAssets(prev=>{
+      const list=(prev&&prev[propId])||[];
+      return{...(prev||{}),[propId]:list.filter(r=>r.id!==id)};
+    });
+  }
+  return(
+    <div className="xl-wrap" style={{overflowX:"auto"}}>
+      <table className="xl-table" style={{minWidth:900}}>
+        <thead>
+          <tr>
+            {ASSET_COLS.map(c=><th key={c.key} style={{padding:"7px 8px",fontSize:".7rem",textAlign:"left",whiteSpace:"nowrap"}}>{c.label}</th>)}
+            {!readOnly&&<th style={{width:36}}></th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r=>(
+            <tr key={r.id} style={{borderTop:"1px solid var(--line)"}}>
+              {ASSET_COLS.map(c=>(
+                <td key={c.key} style={{padding:"3px 6px"}}>
+                  {c.key==="areaName"?(
+                    <>
+                      <input list={"asset-area-list-"+propId} value={r.areaName||""} readOnly={readOnly}
+                        onChange={e=>updateRow(r.id,"areaName",e.target.value)} placeholder="e.g. Silver Cloud"
+                        style={{width:"100%",minWidth:110,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:5,fontSize:".76rem",fontFamily:"var(--ff)"}}/>
+                      <datalist id={"asset-area-list-"+propId}>{rooms.map(rm=><option key={rm} value={rm}/>)}</datalist>
+                    </>
+                  ):(
+                    <input type={c.type||"text"} value={r[c.key]||""} readOnly={readOnly}
+                      onChange={e=>updateRow(r.id,c.key,e.target.value)} placeholder={c.type?"":c.label}
+                      style={{width:"100%",minWidth:c.type==="date"?128:110,padding:"4px 6px",border:"1px solid var(--line)",borderRadius:5,fontSize:".76rem",fontFamily:"var(--ff)"}}/>
+                  )}
+                </td>
+              ))}
+              {!readOnly&&<td style={{textAlign:"center"}}>
+                <button onClick={()=>removeRow(r.id)} title="Remove asset"
+                  style={{border:"none",background:"none",color:"#DC2626",cursor:"pointer",fontSize:".9rem"}}>🗑</button>
+              </td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length===0&&<div className="empty" style={{padding:"20px 0"}}>No assets recorded yet.{!readOnly&&" Click + Add Asset below to start."}</div>}
+      {!readOnly&&<button onClick={addRow} style={{marginTop:10,padding:"6px 14px",background:"#0F5C4C",color:"#fff",border:"none",borderRadius:6,fontSize:".76rem",fontWeight:700,cursor:"pointer"}}>+ Add Asset</button>}
+    </div>
   );
 }
 
@@ -1266,7 +1420,7 @@ function InvReceivedModal({session,checks,setChecks,customItems,setCustomItems,r
 }
 
 /* ══ PM PORTAL ══════════════════════════════════════════════ */
-function PMPortal({session,onLogout,checks,setChecks,photos,setPhotos,requests,setRequests,customItems,setCustomItems,proc,setProc,received,setReceived}){
+function PMPortal({session,onLogout,checks,setChecks,photos,setPhotos,requests,setRequests,customItems,setCustomItems,proc,setProc,received,setReceived,assets,setAssets}){
   const[area,setArea]=useState("Room Inventory");
   const today=todayYMD();
   const[yr,setYr]=useState(today.y);
@@ -1277,7 +1431,7 @@ function PMPortal({session,onLogout,checks,setChecks,photos,setPhotos,requests,s
   const[editItems,setEditItems]=useState(false);
   const[syncing,setSyncing]=useState(false);
   const[syncMsg,setSyncMsg]=useState(null);
-  const SYNC_KEYS=["seclude_checks","seclude_requests","seclude_custom_items","seclude_proc_v2","seclude_received","seclude_office_items","seclude_exp"];
+  const SYNC_KEYS=["seclude_checks","seclude_requests","seclude_custom_items","seclude_proc_v2","seclude_received","seclude_office_items","seclude_exp","seclude_assets"];
   async function mergeLocalToFirestore(){
     if(!window.db)return;
     for(const key of SYNC_KEYS){
@@ -1317,7 +1471,7 @@ function PMPortal({session,onLogout,checks,setChecks,photos,setPhotos,requests,s
       }
     }catch(e){fail++;console.warn("[ForceSync] seclude_checks",e);}
     // All other keys: safe to write in full
-    const OTHER_KEYS=["seclude_requests","seclude_custom_items","seclude_proc_v2","seclude_received","seclude_office_items","seclude_exp"];
+    const OTHER_KEYS=["seclude_requests","seclude_custom_items","seclude_proc_v2","seclude_received","seclude_office_items","seclude_exp","seclude_assets"];
     for(const key of OTHER_KEYS){
       try{
         const raw=localStorage.getItem(key);
@@ -1368,10 +1522,14 @@ function PMPortal({session,onLogout,checks,setChecks,photos,setPhotos,requests,s
         <div className="atabs" style={{marginBottom:12}}>
           {AREAS.map(a=><button key={a} className={"atab"+(area===a?" on":"")} onClick={()=>setArea(a)}>{a}</button>)}
         </div>
+        {area==="Assets"?(
+          <AssetRegisterTable propId={session.propId} assets={assets} setAssets={setAssets} rooms={(INV[session.propId]?.["Room Inventory"]?.rooms)||[]}/>
+        ):(<>
         <div style={{fontSize:".72rem",color:"var(--ink3)",marginBottom:8,fontFamily:"var(--fm)"}}>
           Click <span style={{background:"#DCFCE7",color:"#15803D",padding:"1px 6px",borderRadius:4,fontWeight:700}}>condition cell</span> to cycle · Enter quantities · Click 📷 to attach a photo · Scroll right for all rooms
         </div>
         <PMExcelTable propId={session.propId} area={area} yr={yr} mn={mn} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} customItems={customItems} setCustomItems={setCustomItems} editItems={editItems}/>
+        </>)}
         {myReqs.length>0&&<div style={{marginTop:18}}>
           <div style={{fontWeight:700,fontSize:".82rem",marginBottom:8}}>Your Recent Requests</div>
           {myReqs.map(r=><div key={r.id} style={{background:"var(--white)",border:"1px solid var(--line)",borderRadius:9,padding:"10px 13px",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
@@ -1454,7 +1612,7 @@ function ReceivedLog({received,showProp=true}){
 }
 
 /* ══ HQ APP ═════════════════════════════════════════════════ */
-function HQApp({session,onLogout,checks,setChecks,photos,setPhotos,requests,setRequests,customItems,setCustomItems,proc,setProc,received,setReceived}){
+function HQApp({session,onLogout,checks,setChecks,photos,setPhotos,requests,setRequests,customItems,setCustomItems,proc,setProc,received,setReceived,assets,setAssets}){
   const currentHQUser=HQ_USERS.find(u=>u.email===session.user?.email)||session.user;
   const isViewer=currentHQUser?.role==="Viewer";
   const[page,setPage]=useState("dashboard");
@@ -1543,7 +1701,7 @@ function HQApp({session,onLogout,checks,setChecks,photos,setPhotos,requests,setR
         <div id="content">
           {page==="dashboard"&&<HQDashboard requests={requests||[]} proc={proc} exp={exp} onNav={nav}/>}
           {page==="properties"&&!selProp&&<HQPropList onSelect={p=>nav("properties",{prop:p})}/>}
-          {page==="properties"&&curProp&&<HQPropDetail prop={curProp} area={propArea} setArea={setPropArea} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} yr={yr} mn={mn} setYr={setYr} setMn={setMn} onBack={()=>setSelProp(null)} customItems={customItems} setCustomItems={setCustomItems} isViewer={isViewer}/>}
+          {page==="properties"&&curProp&&<HQPropDetail prop={curProp} area={propArea} setArea={setPropArea} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} yr={yr} mn={mn} setYr={setYr} setMn={setMn} onBack={()=>setSelProp(null)} customItems={customItems} setCustomItems={setCustomItems} isViewer={isViewer} assets={assets} setAssets={setAssets}/>}
           {page==="requests"&&<HQRequests requests={requests||[]} setRequests={setRequests} proc={proc} setProc={setProc} received={received} setReceived={setReceived} isViewer={isViewer}/>}
           {page==="received"&&<ReceivedLog received={received} showProp={true}/>}
           {page==="purchases"&&<HQPurchases proc={proc} setProc={setProc} isViewer={isViewer}/>}
@@ -1664,7 +1822,7 @@ function HQPropList({onSelect}){
 }
 
 /* ══ HQ PROPERTY DETAIL ════════════════════════════════════ */
-function HQPropDetail({prop,area,setArea,checks,setChecks,photos,setPhotos,yr,mn,setYr,setMn,onBack,customItems,setCustomItems,isViewer}){
+function HQPropDetail({prop,area,setArea,checks,setChecks,photos,setPhotos,yr,mn,setYr,setMn,onBack,customItems,setCustomItems,isViewer,assets,setAssets}){
   const[editMode,setEditMode]=useState(false);
   function prevMon(){if(mn===1){setYr(y=>y-1);setMn(12);}else setMn(m=>m-1);}
   function nextMon(){if(mn===12){setYr(y=>y+1);setMn(1);}else setMn(m=>m+1);}
@@ -1692,10 +1850,14 @@ function HQPropDetail({prop,area,setArea,checks,setChecks,photos,setPhotos,yr,mn
         </div>
       </div>
       <div className="atabs">{AREAS.map(a=><button key={a} className={"atab"+(area===a?" on":"")} onClick={()=>setArea(a)}>{a}</button>)}</div>
-      {!editMode&&<div style={{fontSize:".72rem",color:"var(--ink3)",marginBottom:10,fontFamily:"var(--fm)",background:"var(--gxl)",border:"1px solid var(--gl)",borderRadius:7,padding:"6px 12px"}}>
+      {!editMode&&area!=="Assets"&&<div style={{fontSize:".72rem",color:"var(--ink3)",marginBottom:10,fontFamily:"var(--fm)",background:"var(--gxl)",border:"1px solid var(--gl)",padding:"6px 12px",borderRadius:7}}>
         HQ view · Click <strong>✏️ Edit Inventory</strong> to make changes · Click 📷 to upload photos
       </div>}
-      <PMExcelTable propId={prop.id} area={area} yr={yr} mn={mn} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} readOnly={isViewer||!editMode} customItems={customItems} setCustomItems={setCustomItems} editItems={!isViewer&&editMode}/>
+      {area==="Assets"?(
+        <AssetRegisterTable propId={prop.id} assets={assets} setAssets={setAssets} readOnly={isViewer||!editMode} rooms={prop.rooms||[]}/>
+      ):(
+        <PMExcelTable propId={prop.id} area={area} yr={yr} mn={mn} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} readOnly={isViewer||!editMode} customItems={customItems} setCustomItems={setCustomItems} editItems={!isViewer&&editMode}/>
+      )}
     </div>
   );
 }
@@ -2371,6 +2533,7 @@ function App(){
   const[proc,setProc]=useFirestore("seclude_proc_v2",INIT_PROC,500);
   const[received,setReceived]=useFirestore("seclude_received",INIT_RECEIVED,500);
   const[officeItems,setOfficeItems]=useFirestore("seclude_office_items",{},1000);
+  const[assets,setAssets]=useFirestore("seclude_assets",{},1000);
   // Keep session alive in sessionStorage so reload never loses PM/HQ state
   useEffect(()=>{
     if(session){const js=JSON.stringify(session);try{localStorage.setItem('seclude_ops_session',js);}catch{}try{sessionStorage.setItem('seclude_ops_session',js);}catch{}}
@@ -2413,9 +2576,9 @@ function App(){
     localStorage.setItem("seclude_seeded_v4","1");
   },[]);
   if(!session)return<Login onLogin={handleLogin}/>;
-  if(session.type==="pm")return<PMPortal session={session} onLogout={handleLogout} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} requests={requests} setRequests={setRequests} customItems={customItems} setCustomItems={setCustomItems} proc={proc} setProc={setProc} received={received} setReceived={setReceived}/>;
+  if(session.type==="pm")return<PMPortal session={session} onLogout={handleLogout} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} requests={requests} setRequests={setRequests} customItems={customItems} setCustomItems={setCustomItems} proc={proc} setProc={setProc} received={received} setReceived={setReceived} assets={assets} setAssets={setAssets}/>;
   if(session.type==="office")return<OfficeStorage session={session} onLogout={handleLogout} officeItems={officeItems} setOfficeItems={setOfficeItems}/>;
-  return<HQApp session={session} onLogout={handleLogout} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} requests={requests} setRequests={setRequests} customItems={customItems} setCustomItems={setCustomItems} proc={proc} setProc={setProc} received={received} setReceived={setReceived}/>;
+  return<HQApp session={session} onLogout={handleLogout} checks={checks} setChecks={setChecks} photos={photos} setPhotos={setPhotos} requests={requests} setRequests={setRequests} customItems={customItems} setCustomItems={setCustomItems} proc={proc} setProc={setProc} received={received} setReceived={setReceived} assets={assets} setAssets={setAssets}/>;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
